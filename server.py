@@ -9,13 +9,17 @@ try:
 
     @server.PromptServer.instance.routes.get("/vsrfi/video_info")
     async def get_video_info(request):
+        # Support both full filesystem path and ComfyUI filename
+        full_path = request.query.get("path", "")
         filename = request.query.get("filename", "")
-        file_type = request.query.get("type", "input")
 
-        if not filename:
-            return web.json_response({"error": "no filename"}, status=400)
+        if full_path:
+            file_path = full_path
+        elif filename:
+            file_path = folder_paths.get_annotated_filepath(filename)
+        else:
+            return web.json_response({"error": "no filename or path"}, status=400)
 
-        file_path = folder_paths.get_annotated_filepath(filename)
         if not os.path.exists(file_path):
             return web.json_response({"error": "file not found"}, status=404)
 
@@ -53,6 +57,26 @@ try:
             })
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
+
+    @server.PromptServer.instance.routes.get("/vsrfi/view")
+    async def view_video(request):
+        """Serve a video file from an absolute filesystem path for preview."""
+        file_path = request.query.get("path", "")
+        if not file_path or not os.path.exists(file_path):
+            return web.Response(status=404)
+
+        content_types = {
+            '.mp4': 'video/mp4',
+            '.webm': 'video/webm',
+            '.mkv': 'video/x-matroska',
+            '.mov': 'video/quicktime',
+            '.avi': 'video/x-msvideo',
+            '.gif': 'image/gif',
+        }
+        ext = os.path.splitext(file_path)[1].lower()
+        content_type = content_types.get(ext, 'application/octet-stream')
+
+        return web.FileResponse(file_path, headers={'Content-Type': content_type})
 
 except ImportError:
     pass

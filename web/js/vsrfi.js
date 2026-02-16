@@ -6,6 +6,10 @@ function fitHeight(node) {
     node?.graph?.setDirtyCanvas(true, true);
 }
 
+function isAbsolutePath(p) {
+    return p.startsWith('/') || /^[A-Za-z]:[\\\/]/.test(p);
+}
+
 app.registerExtension({
     name: "VSRFI.VideoUpload",
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
@@ -16,12 +20,13 @@ app.registerExtension({
             onNodeCreated?.apply(this, arguments);
 
             const node = this;
-            const videoWidget = this.widgets.find(w => w.name === "video");
+            const videoWidget = this.widgets.find(w => w.name === "video_path");
+            if (!videoWidget) return;
 
             // Video metadata from server
             let videoInfo = { fps: 30, frame_count: 0, duration: 0 };
 
-            // --- File input for upload ---
+            // --- File input for picking files ---
             const fileInput = document.createElement("input");
             Object.assign(fileInput, {
                 type: "file",
@@ -29,11 +34,23 @@ app.registerExtension({
                 style: "display: none",
                 onchange: async () => {
                     if (fileInput.files.length) {
-                        await doUpload(fileInput.files[0]);
+                        await handleFile(fileInput.files[0]);
                     }
                 }
             });
             document.body.append(fileInput);
+
+            // --- Handle a selected/dropped file ---
+            async function handleFile(file) {
+                if (file.path) {
+                    // Electron/desktop: full filesystem path available — use directly
+                    videoWidget.value = file.path;
+                    videoWidget.callback?.(file.path);
+                } else {
+                    // Regular browser: upload to ComfyUI input directory
+                    await doUpload(file);
+                }
+            }
 
             async function doUpload(file) {
                 const body = new FormData();
@@ -48,9 +65,6 @@ app.registerExtension({
                     if (resp.status === 200) {
                         const data = await resp.json();
                         const filename = data.name;
-                        if (!videoWidget.options.values.includes(filename)) {
-                            videoWidget.options.values.push(filename);
-                        }
                         videoWidget.value = filename;
                         videoWidget.callback?.(filename);
                     }
@@ -60,8 +74,8 @@ app.registerExtension({
                 }
             }
 
-            // --- Upload button widget ---
-            const uploadBtn = this.addWidget("button", "choose video to upload", null, () => {
+            // --- Choose video button ---
+            const uploadBtn = this.addWidget("button", "choose video", null, () => {
                 app.canvas.node_widget = null;
                 fileInput.click();
             });
@@ -73,7 +87,7 @@ app.registerExtension({
                 if (!e?.dataTransfer?.types?.includes?.('Files')) return false;
                 const file = e.dataTransfer?.files?.[0];
                 if (file && (file.type.startsWith('video/') || file.type === 'image/gif')) {
-                    await doUpload(file);
+                    await handleFile(file);
                     return true;
                 }
                 return false;
@@ -152,7 +166,9 @@ app.registerExtension({
             async function queryVideoInfo(filename) {
                 if (!filename) return;
                 try {
-                    const params = new URLSearchParams({ filename, type: "input" });
+                    const params = isAbsolutePath(filename)
+                        ? new URLSearchParams({ path: filename })
+                        : new URLSearchParams({ filename, type: "input" });
                     const resp = await api.fetchApi("/vsrfi/video_info?" + params);
                     if (resp.status === 200) {
                         videoInfo = await resp.json();
@@ -197,14 +213,23 @@ app.registerExtension({
                     fitHeight(node);
                     return;
                 }
-                const ext = filename.split('.').pop().toLowerCase();
-                const format = "video/" + ext;
-                const params = new URLSearchParams({
-                    filename: filename,
-                    type: "input",
-                    format: format
-                });
-                videoEl.src = api.apiURL("/view?" + params);
+
+                if (isAbsolutePath(filename)) {
+                    // Full filesystem path — use custom VSRFI endpoint
+                    const params = new URLSearchParams({ path: filename });
+                    videoEl.src = api.apiURL("/vsrfi/view?" + params);
+                } else {
+                    // Filename only (uploaded) — use ComfyUI's /view endpoint
+                    const ext = filename.split('.').pop().toLowerCase();
+                    const format = "video/" + ext;
+                    const params = new URLSearchParams({
+                        filename: filename,
+                        type: "input",
+                        format: format
+                    });
+                    videoEl.src = api.apiURL("/view?" + params);
+                }
+
                 videoEl.hidden = false;
                 previewWidget.parentEl.hidden = false;
                 fitHeight(node);

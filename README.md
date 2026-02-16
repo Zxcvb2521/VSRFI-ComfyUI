@@ -66,4 +66,6 @@ Models are cached and reused across sessions.
 | **max_tile_kilopixels** | INT | 4000 | Max tile size in kilopixels for spatial tiling (0=no tiling) |
 | **interpolation_factor** | INT | 2 | Frame interpolation multiplier (1=no interpolation, 2=double framerate, etc.) |
 
+git config --global user.name "Neilthefrobot"
+git config --global user.email "imsogangstagangsta@yahoo.com"
 

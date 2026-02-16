@@ -1,5 +1,5 @@
 """VSRFI Frames Node - Processes IMAGE tensor batches instead of video files"""
-import os, sys, torch, numpy as np
+import os, sys, torch, math, numpy as np
 from pathlib import Path
 from einops import rearrange
 import torch.nn.functional as F
@@ -55,6 +55,7 @@ class VSRFIFramesNode:
                 "interpolation_factor": ("INT", {"default": 2, "min": 1, "max": 16}),
                 "frames_per_chunk": ("INT", {"default": 100, "min": 1, "max": 100000}),
                 "max_tile_kilopixels": ("INT", {"default": 0, "min": 0, "max": 100000}),
+                "max_vfi_kilopixels": ("INT", {"default": 0, "min": 0, "max": 100000}),
             }
         }
 
@@ -62,7 +63,7 @@ class VSRFIFramesNode:
     FUNCTION = "process"
     CATEGORY = "video"
 
-    def process(self, frames, scale, interpolation_factor, frames_per_chunk, max_tile_kilopixels):
+    def process(self, frames, scale, interpolation_factor, frames_per_chunk, max_tile_kilopixels, max_vfi_kilopixels):
         # Unload all ComfyUI models (e.g. video generation) and free VRAM before loading our models
         if comfy is not None:
             comfy.model_management.unload_all_models()
@@ -76,10 +77,6 @@ class VSRFIFramesNode:
 
         device = "cuda:0"
 
-        # Load models
-        pipe = self.load_flashvsr(device)
-        vfi = self.load_vfi(device) if interpolation_factor > 1 else None
-
         N, h, w, c = frames.shape
         print(f"[DEBUG] Original input: {w}x{h}")
 
@@ -89,13 +86,17 @@ class VSRFIFramesNode:
         print(f"[INFO] Processing {frames_resized.shape[0]} frames at {w}x{h} -> {w*scale}x{h*scale}")
 
         # Step 1: Upscale all frames spatially in chunks
+        pipe = self.load_flashvsr(device)
         upscaled_frames = self.upscale_all_frames(pipe, frames_resized, scale, frames_per_chunk, max_tile_kilopixels, device)
+        del pipe
         clean_vram()
 
         # Step 2: Frame interpolation (if needed)
-        if vfi and interpolation_factor > 1:
+        if interpolation_factor > 1:
+            vfi = self.load_vfi(device)
             print(f"[INFO] Interpolating {upscaled_frames.shape[0]} frames by {interpolation_factor}x")
-            final_frames = self.interpolate_all_frames(vfi, upscaled_frames, interpolation_factor, device)
+            final_frames = self.interpolate_all_frames(vfi, upscaled_frames, interpolation_factor, max_vfi_kilopixels, device)
+            del vfi
             clean_vram()
         else:
             final_frames = upscaled_frames
@@ -197,16 +198,27 @@ class VSRFIFramesNode:
 
         return torch.cat(all_upscaled, dim=0)
 
+    def _auto_max_input_pixels(self, scale, device):
+        """Estimate max input tile pixels from available VRAM and scale factor."""
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        free_gb = free_bytes / (1024**3)
+        # Reserve for model weights loaded during inference (DiT + TCDecoder)
+        model_inference_gb = 3.5
+        available_gb = max(0.5, free_gb - model_inference_gb) * 0.85
+        # Empirical: VRAM scales as input_pixels * scale^2.6
+        max_pixels = available_gb * 210000 / (scale ** 2.6)
+        equivalent_kpx = int(max_pixels * (scale ** 3) / 1000)
+        print(f"[INFO] Auto tile: max {max_pixels/1000:.0f}k input pixels for scale={scale}, equivalent max_tile_kilopixels={equivalent_kpx} (GPU {total_bytes/(1024**3):.1f}GB total, {free_gb:.1f}GB free, {available_gb:.1f}GB available)")
+        return max_pixels
+
     def _upscale_chunk(self, pipe, frames, scale, max_tile_kilopixels, device):
         """Upscale a chunk of frames"""
         N, h, w, c = frames.shape
 
-        # Determine if tiling is needed
         if max_tile_kilopixels == 0:
-            return self._upscale_full(pipe, frames, scale, device)
-
-        # Check if tiling is needed based on pixel count
-        max_pixels = max_tile_kilopixels * 1000 / (scale ** 3)
+            max_pixels = self._auto_max_input_pixels(scale, device)
+        else:
+            max_pixels = max_tile_kilopixels * 1000 / (scale ** 3)
 
         splits_w = splits_h = 1
         while (w / splits_w) * (h / splits_h) > max_pixels:
@@ -322,7 +334,8 @@ class VSRFIFramesNode:
                 comfy.model_management.throw_exception_if_processing_interrupted()
 
             tile_w, tile_h = x2 - x1, y2 - y1
-            print(f"[DEBUG] Tile {i+1}/{len(tiles)}: {tile_w}x{tile_h} = {tile_w*tile_h/1000:.0f}k pixels at ({x1},{y1})")
+            out_pixels = tile_w * tile_h * scale * scale
+            print(f"[DEBUG] Tile {i+1}/{len(tiles)}: {tile_w}x{tile_h} -> {tile_w*scale}x{tile_h*scale} = {out_pixels/1000:.0f}k output pixels at ({x1},{y1})")
 
             tile_frames = frames[:, y1:y2, x1:x2, :]
             tile_output = self._upscale_full(pipe, tile_frames, scale, device)
@@ -368,18 +381,35 @@ class VSRFIFramesNode:
 
         return result
 
-    def interpolate_all_frames(self, vfi, frames, factor, device):
+    def interpolate_all_frames(self, vfi, frames, factor, max_vfi_kilopixels, device):
         """Interpolate frames to increase frame count"""
-        # Auto-calculate ds_factor: use full resolution if <= 1M pixels, otherwise scale down to ~1M
-        # Must snap to 0.25 steps since InputPadder produces multiples of 32, and RAFT needs multiples of 8
-        frame_pixels = frames.shape[1] * frames.shape[2]
-        if frame_pixels > 1_000_000:
-            raw_ds = (1_000_000 / frame_pixels) ** 0.5
-            ds_factor = max(0.25, round(raw_ds * 4) / 4)
-            print(f"[DEBUG] VFI ds_factor: {ds_factor:.2f} ({frames.shape[2]}x{frames.shape[1]} = {frame_pixels/1000:.0f}k pixels)")
+        # Move frames to CPU to free GPU memory for VFI computation
+        frames = frames.cpu()
+        clean_vram()
+
+        # Auto-calculate ds_factor for flow estimation downscaling.
+        # ds_factor must produce dimensions divisible by 8 (required by RAFT / build_coord).
+        # Padded dims are multiples of 32; valid ds_factors are multiples of 1/(4*gcd(h/32, w/32)).
+        h, w = frames.shape[1], frames.shape[2]
+        pad_factor = 32
+        padded_h = h + (pad_factor - h % pad_factor) % pad_factor
+        padded_w = w + (pad_factor - w % pad_factor) % pad_factor
+        padded_pixels = padded_h * padded_w
+        if max_vfi_kilopixels == 0:
+            max_pixels = 1000000
+        else:
+            max_pixels = max_vfi_kilopixels * 1000
+        if padded_pixels > max_pixels:
+            raw_ds = (max_pixels / padded_pixels) ** 0.5
+            a, b = padded_h // 32, padded_w // 32
+            ds_step = 1.0 / (4 * math.gcd(a, b))
+            ds_factor = max(ds_step, round(raw_ds / ds_step) * ds_step)
+            result_h = int(padded_h * ds_factor)
+            result_w = int(padded_w * ds_factor)
+            print(f"[DEBUG] VFI ds_factor: {ds_factor:.4f} ({w}x{h} padded to {padded_w}x{padded_h}, downscaled to {result_w}x{result_h} = {result_h*result_w/1000:.0f}k pixels)")
         else:
             ds_factor = None
-            print(f"[DEBUG] VFI ds_factor: None ({frames.shape[2]}x{frames.shape[1]} = {frame_pixels/1000:.0f}k pixels, no downscale)")
+            print(f"[DEBUG] VFI ds_factor: None ({w}x{h} = {h*w/1000:.0f}k pixels, no downscale)")
 
         # frames: (N, H, W, C) in range [0, 1]
         frames_chw = frames.permute(0, 3, 1, 2)

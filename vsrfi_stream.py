@@ -1,5 +1,5 @@
 """VSRFI - Video Super Resolution + Frame Interpolation Node"""
-import os, sys, cv2, torch, numpy as np
+import os, sys, cv2, torch, math, numpy as np
 from pathlib import Path
 from tqdm import tqdm
 import torch.nn.functional as F
@@ -107,47 +107,53 @@ VIDEO_EXTENSIONS = ['webm', 'mp4', 'mkv', 'gif', 'mov', 'avi']
 class VSRFINode:
     @classmethod
     def INPUT_TYPES(cls):
-        input_dir = folder_paths.get_input_directory() if folder_paths else ""
-        files = []
-        if input_dir and os.path.isdir(input_dir):
-            for f in os.listdir(input_dir):
-                if os.path.isfile(os.path.join(input_dir, f)):
-                    ext = f.rsplit('.', 1)[-1].lower() if '.' in f else ''
-                    if ext in VIDEO_EXTENSIONS:
-                        files.append(f)
         return {
             "required": {
-                "video": (sorted(files),),
+                "video_path": ("STRING", {"default": ""}),
                 "output_path": ("STRING", {"default": ""}),
                 "scale": ("INT", {"default": 2, "min": 1, "max": 16}),
                 "interpolation_factor": ("INT", {"default": 2, "min": 1, "max": 16}),
                 "frames_per_chunk": ("INT", {"default": 100, "min": 1}),
                 "max_tile_kilopixels": ("INT", {"default": 4000, "min": 0, "max": 999999}),
+                "max_vfi_kilopixels": ("INT", {"default": 0, "min": 0, "max": 100000}),
                 "skip_first_frames": ("INT", {"default": 0, "min": 0, "max": 999999, "step": 1}),
                 "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": 999999, "step": 1}),
             }
         }
 
     RETURN_TYPES = ("STRING",)
+    OUTPUT_NODE = True
     FUNCTION = "process"
     CATEGORY = "video"
 
     @classmethod
-    def IS_CHANGED(cls, video, **kwargs):
-        video_path = folder_paths.get_annotated_filepath(video) if folder_paths else video
+    def _resolve_video_path(cls, video_path):
+        """Resolve video path: check as-is first, then ComfyUI input directory."""
         if os.path.exists(video_path):
-            return os.path.getmtime(video_path)
+            return video_path
+        if folder_paths is not None:
+            candidate = os.path.join(folder_paths.get_input_directory(), video_path)
+            if os.path.exists(candidate):
+                return candidate
+        return video_path
+
+    @classmethod
+    def IS_CHANGED(cls, video_path, **kwargs):
+        resolved = cls._resolve_video_path(video_path)
+        if os.path.exists(resolved):
+            return os.path.getmtime(resolved)
         return ""
 
     @classmethod
-    def VALIDATE_INPUTS(cls, video, **kwargs):
-        if folder_paths and not folder_paths.exists_annotated_filepath(video):
-            return "Invalid video file: {}".format(video)
+    def VALIDATE_INPUTS(cls, video_path, **kwargs):
+        if not video_path:
+            return "No video path provided"
+        resolved = cls._resolve_video_path(video_path)
+        if not os.path.exists(resolved):
+            return "Invalid video file: {}".format(video_path)
         return True
 
-    def process(self, video, output_path, scale, frames_per_chunk, max_tile_kilopixels, interpolation_factor, skip_first_frames=0, frame_load_cap=0):
-        # Resolve video path from combo widget value
-        video_path = folder_paths.get_annotated_filepath(video) if folder_paths else video
+    def process(self, video_path, output_path, scale, frames_per_chunk, max_tile_kilopixels, max_vfi_kilopixels, interpolation_factor, skip_first_frames=0, frame_load_cap=0):
 
         # Unload all ComfyUI models (e.g. video generation) and free VRAM before loading our models
         if comfy is not None:
@@ -157,7 +163,11 @@ class VSRFINode:
         # Reset attention logging so we log which backend is used for this run
         wan_video_dit.reset_attention_logging()
 
-        # Validate input video exists
+        # Resolve video path: check as-is first, then ComfyUI input directory (for uploaded files)
+        if not os.path.exists(video_path) and folder_paths is not None:
+            candidate = os.path.join(folder_paths.get_input_directory(), video_path)
+            if os.path.exists(candidate):
+                video_path = candidate
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Input video not found: {video_path}")
 
@@ -166,21 +176,32 @@ class VSRFINode:
 
         device = "cuda:0"
 
-        # Generate output path if not provided
-        if not output_path:
-            input_path = Path(video_path)
-            output_path = str(input_path.with_stem(input_path.stem + "_VSRFI"))
+        # Default output directory: comfyui/output/VSRFI/
+        default_output_dir = os.path.join(
+            folder_paths.get_output_directory() if folder_paths else os.getcwd(), "VSRFI"
+        )
+
+        # Determine output path
+        if output_path:
+            # User provided a path — validate the parent directory exists
+            output_dir = os.path.dirname(output_path)
+            if output_dir and not os.path.isdir(output_dir):
+                print(f"[WARNING] Output directory does not exist: {output_dir} — falling back to {default_output_dir}")
+                output_path = os.path.join(default_output_dir, os.path.basename(output_path))
+        else:
+            # No output path — save to default VSRFI folder with input filename + _VSRFI
+            input_name = Path(video_path).stem + "_VSRFI" + Path(video_path).suffix
+            output_path = os.path.join(default_output_dir, input_name)
+
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
         # Handle filename conflicts
         output_path = get_unique_filename(output_path)
         print(f"Output will be saved to: {output_path}")
 
-        # Load models
-        pipe = self.load_flashvsr(device)
-        vfi = self.load_vfi(device) if interpolation_factor > 1 else None
-
         # Process video
-        self.process_video(video_path, output_path, pipe, vfi, scale, frames_per_chunk, max_tile_kilopixels, interpolation_factor, device, skip_first_frames, frame_load_cap)
+        self.process_video(video_path, output_path, scale, frames_per_chunk, max_tile_kilopixels, max_vfi_kilopixels, interpolation_factor, device, skip_first_frames, frame_load_cap)
         return (output_path,)
     
     def load_flashvsr(self, device):
@@ -243,7 +264,7 @@ class VSRFINode:
         model.dtype = dtype
         return model
     
-    def process_video(self, input_path, output_path, pipe, vfi, scale, frames_per_chunk, max_tile_kilopixels, interp_factor, device, skip_first_frames=0, frame_load_cap=0):
+    def process_video(self, input_path, output_path, scale, frames_per_chunk, max_tile_kilopixels, max_vfi_kilopixels, interp_factor, device, skip_first_frames=0, frame_load_cap=0):
         cap = cv2.VideoCapture(input_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
         w_orig, h_orig = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -281,7 +302,10 @@ class VSRFINode:
                 print("[INFO] Audio track detected in input video")
             else:
                 print("[INFO] No audio track found in input video")
-        except (subprocess.TimeoutExpired, Exception) as e:
+        except FileNotFoundError:
+            print("[WARNING] ffprobe not found. Please install ffmpeg and ensure it is on your system PATH.")
+            print("[WARNING] Download from https://ffmpeg.org/download.html")
+        except Exception as e:
             print(f"[WARNING] Could not probe audio: {e}")
 
         w, h = w_orig, h_orig
@@ -310,7 +334,13 @@ class VSRFINode:
             video_only_path
         ]
 
-        process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            raise RuntimeError(
+                "ffmpeg not found. Please install ffmpeg and ensure it is on your system PATH.\n"
+                "Download from https://ffmpeg.org/download.html"
+            )
 
         # Initialize progress bars
         # ComfyUI progress bar (if available)
@@ -343,18 +373,13 @@ class VSRFINode:
                         if comfy is not None:
                             comfy.model_management.throw_exception_if_processing_interrupted()
 
-                        # Process chunk - if cancelled during processing, exception will be raised
-                        # and this chunk won't be written to the video file
                         try:
-                            chunk = self.upscale_chunk(pipe, torch.from_numpy(np.stack(buffer)), scale, max_tile_kilopixels, device)
-                            if vfi: chunk = self.interpolate_chunk(vfi, chunk, interp_factor, device)
+                            chunk = self._process_chunk(buffer, scale, max_tile_kilopixels, max_vfi_kilopixels, interp_factor, device)
 
-                            # Only write to video if chunk completed successfully
                             for frame in chunk:
                                 frame_out = (frame.numpy() * 255).clip(0, 255).astype(np.uint8)
                                 process.stdin.write(frame_out.tobytes())
 
-                            # Update progress only after successful write
                             chunk_size = len(buffer)
                             frames_processed += chunk_size
                             tqdm_bar.update(chunk_size)
@@ -364,28 +389,23 @@ class VSRFINode:
                             buffer = []
                             clean_vram()
                         except (comfy.model_management.InterruptProcessingException if comfy else Exception) as e:
-                            # If cancelled during chunk processing, discard this chunk
-                            # frames_processed remains at the last completed chunk
                             raise
 
                 # Process remaining frames (if not cancelled)
                 if buffer:
                     try:
-                        chunk = self.upscale_chunk(pipe, torch.from_numpy(np.stack(buffer)), scale, max_tile_kilopixels, device)
-                        if vfi: chunk = self.interpolate_chunk(vfi, chunk, interp_factor, device)
+                        chunk = self._process_chunk(buffer, scale, max_tile_kilopixels, max_vfi_kilopixels, interp_factor, device)
 
                         for frame in chunk:
                             frame_out = (frame.numpy() * 255).clip(0, 255).astype(np.uint8)
                             process.stdin.write(frame_out.tobytes())
 
-                        # Update final progress
                         chunk_size = len(buffer)
                         frames_processed += chunk_size
                         tqdm_bar.update(chunk_size)
                         if pbar is not None:
                             pbar.update_absolute(frames_processed)
                     except (comfy.model_management.InterruptProcessingException if comfy else Exception) as e:
-                        # If cancelled during final chunk, discard it
                         raise
 
         except (comfy.model_management.InterruptProcessingException if comfy else Exception) as e:
@@ -468,12 +488,43 @@ class VSRFINode:
                     print(f"[INFO] Partial video saved successfully.")
                     raise comfy.model_management.InterruptProcessingException()
     
+    def _process_chunk(self, buffer, scale, max_tile_kilopixels, max_vfi_kilopixels, interp_factor, device):
+        """Process a single chunk: load FlashVSR, upscale, destroy it, then load VFI, interpolate, destroy it."""
+        frames = torch.from_numpy(np.stack(buffer))
+
+        # Upscale
+        pipe = self.load_flashvsr(device)
+        chunk = self.upscale_chunk(pipe, frames, scale, max_tile_kilopixels, device)
+        del pipe
+        clean_vram()
+
+        # Interpolate
+        if interp_factor > 1:
+            vfi = self.load_vfi(device)
+            chunk = self.interpolate_chunk(vfi, chunk, interp_factor, max_vfi_kilopixels, device)
+            del vfi
+            clean_vram()
+
+        return chunk
+
+    def _auto_max_input_pixels(self, scale, device):
+        """Estimate max input tile pixels from available VRAM and scale factor."""
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        free_gb = free_bytes / (1024**3)
+        # Reserve for model weights loaded during inference (DiT + TCDecoder)
+        model_inference_gb = 3.5
+        available_gb = max(0.5, free_gb - model_inference_gb) * 0.85
+        # Empirical: VRAM scales as input_pixels * scale^2.6
+        max_pixels = available_gb * 210000 / (scale ** 2.6)
+        equivalent_kpx = int(max_pixels * (scale ** 3) / 1000)
+        print(f"[INFO] Auto tile: max {max_pixels/1000:.0f}k input pixels for scale={scale}, equivalent max_tile_kilopixels={equivalent_kpx} (GPU {total_bytes/(1024**3):.1f}GB total, {free_gb:.1f}GB free, {available_gb:.1f}GB available)")
+        return max_pixels
+
     def upscale_chunk(self, pipe, frames, scale, max_tile_kilopixels, device):
         if max_tile_kilopixels == 0:
-            return self._upscale_full(pipe, frames, scale, device)
-
-        # max_tile_kilopixels is INPUT pixels at current scale
-        max_pixels = max_tile_kilopixels * 1000 / (scale ** 3)
+            max_pixels = self._auto_max_input_pixels(scale, device)
+        else:
+            max_pixels = max_tile_kilopixels * 1000 / (scale ** 3)
 
         # Calculate optimal splits
         N, h, w, c = frames.shape
@@ -589,7 +640,8 @@ class VSRFINode:
                 comfy.model_management.throw_exception_if_processing_interrupted()
 
             tile_w, tile_h = x2 - x1, y2 - y1
-            print(f"[DEBUG] Tile {i+1}/{len(tiles)}: {tile_w}x{tile_h} = {tile_w*tile_h/1000:.0f}k pixels at ({x1},{y1})")
+            out_pixels = tile_w * tile_h * scale * scale
+            print(f"[DEBUG] Tile {i+1}/{len(tiles)}: {tile_w}x{tile_h} -> {tile_w*scale}x{tile_h*scale} = {out_pixels/1000:.0f}k output pixels at ({x1},{y1})")
 
             tile_frames = frames[:, y1:y2, x1:x2, :]
             tile_output = self._upscale_full(pipe, tile_frames, scale, device)
@@ -635,17 +687,34 @@ class VSRFINode:
         
         return result
     
-    def interpolate_chunk(self, vfi, frames, factor, device):
-        # Auto-calculate ds_factor: use full resolution if <= 1M pixels, otherwise scale down to ~1M
-        # Must snap to 0.25 steps since InputPadder produces multiples of 32, and RAFT needs multiples of 8
-        frame_pixels = frames.shape[1] * frames.shape[2]
-        if frame_pixels > 1_000_000:
-            raw_ds = (1_000_000 / frame_pixels) ** 0.5
-            ds_factor = max(0.25, round(raw_ds * 4) / 4)
-            print(f"[DEBUG] VFI ds_factor: {ds_factor:.2f} ({frames.shape[2]}x{frames.shape[1]} = {frame_pixels/1000:.0f}k pixels)")
+    def interpolate_chunk(self, vfi, frames, factor, max_vfi_kilopixels, device):
+        # Move frames to CPU to free GPU memory for VFI computation
+        frames = frames.cpu()
+        clean_vram()
+
+        # Auto-calculate ds_factor for flow estimation downscaling.
+        # ds_factor must produce dimensions divisible by 8 (required by RAFT / build_coord).
+        # Padded dims are multiples of 32; valid ds_factors are multiples of 1/(4*gcd(h/32, w/32)).
+        h, w = frames.shape[1], frames.shape[2]
+        pad_factor = 32
+        padded_h = h + (pad_factor - h % pad_factor) % pad_factor
+        padded_w = w + (pad_factor - w % pad_factor) % pad_factor
+        padded_pixels = padded_h * padded_w
+        if max_vfi_kilopixels == 0:
+            max_pixels = 1000000
+        else:
+            max_pixels = max_vfi_kilopixels * 1000
+        if padded_pixels > max_pixels:
+            raw_ds = (max_pixels / padded_pixels) ** 0.5
+            a, b = padded_h // 32, padded_w // 32
+            ds_step = 1.0 / (4 * math.gcd(a, b))
+            ds_factor = max(ds_step, round(raw_ds / ds_step) * ds_step)
+            result_h = int(padded_h * ds_factor)
+            result_w = int(padded_w * ds_factor)
+            print(f"[DEBUG] VFI ds_factor: {ds_factor:.4f} ({w}x{h} padded to {padded_w}x{padded_h}, downscaled to {result_w}x{result_h} = {result_h*result_w/1000:.0f}k pixels)")
         else:
             ds_factor = None
-            print(f"[DEBUG] VFI ds_factor: None ({frames.shape[2]}x{frames.shape[1]} = {frame_pixels/1000:.0f}k pixels, no downscale)")
+            print(f"[DEBUG] VFI ds_factor: None ({w}x{h} = {h*w/1000:.0f}k pixels, no downscale)")
 
         frames_chw = frames.permute(0,3,1,2)
         result = []

@@ -15,31 +15,31 @@ from .utils import hash_state_dict_keys
 try:
     import triton
     TRITON_AVAILABLE = True
-except ImportError:
+except Exception:
     TRITON_AVAILABLE = False
 
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
+except Exception:
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
     import flash_attn
     FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
+except Exception:
     FLASH_ATTN_2_AVAILABLE = False
 
 try:
     from sageattention import sageattn
     SAGE_ATTN_AVAILABLE = True
-except ModuleNotFoundError:
+except Exception:
     SAGE_ATTN_AVAILABLE = False
 
 try:
     from block_sparse_attn import block_sparse_attn_func
     BLOCK_ATTN_AVAILABLE = True
-except:
+except Exception:
     BLOCK_ATTN_AVAILABLE = False
 
 # Sparse SageAttention (custom Triton implementation) - only available with Triton
