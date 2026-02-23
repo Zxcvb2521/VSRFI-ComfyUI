@@ -1,5 +1,5 @@
 """VSRFI Frames Node - Processes IMAGE tensor batches instead of video files"""
-import os, sys, torch, math, numpy as np
+import os, sys, torch, math, numpy as np, bisect, gc
 from pathlib import Path
 from einops import rearrange
 import torch.nn.functional as F
@@ -9,15 +9,21 @@ try:
     import folder_paths
     import comfy.utils
     import comfy.model_management
+    from comfy.model_management import soft_empty_cache
 except ImportError:
     print("Warning: ComfyUI imports not available. Using fallback paths.")
     folder_paths = None
     comfy = None
+    def soft_empty_cache(): pass
 
 # Add local paths
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(current_dir, "flashvsr_src"))
 sys.path.insert(0, current_dir)
+
+# Path to comfyui-frame-interpolation for RIFE/FILM support
+_cfi_path = os.path.join(current_dir, "..", "comfyui-frame-interpolation")
+_cfi_available = os.path.isdir(_cfi_path)
 
 from flashvsr_src import ModelManager, FlashVSRTinyLongPipeline
 from flashvsr_src.models.TCDecoder import build_tcdecoder
@@ -28,7 +34,7 @@ from gimmvfi.generalizable_INR.configs import GIMMVFIConfig
 from gimmvfi.generalizable_INR.raft import RAFT
 from omegaconf import OmegaConf
 from safetensors.torch import load_file as load_safetensors
-import yaml, argparse, gc
+import yaml, argparse
 
 # Import model download function from main node
 from vsrfi_stream import download_models_if_needed
@@ -48,14 +54,18 @@ class InputPadder:
 class VSRFIFramesNode:
     @classmethod
     def INPUT_TYPES(cls):
+        vfi_methods = ["GIMM-VFI"]
+        if _cfi_available:
+            vfi_methods += ["RIFE", "FILM"]
         return {
             "required": {
-                "frames": ("IMAGE", {"tooltip": "Input frames as IMAGE tensor batch"}),
-                "scale": ("INT", {"default": 2, "min": 1, "max": 8}),
-                "interpolation_factor": ("INT", {"default": 2, "min": 1, "max": 16}),
-                "frames_per_chunk": ("INT", {"default": 100, "min": 1, "max": 100000}),
-                "max_tile_kilopixels": ("INT", {"default": 0, "min": 0, "max": 100000}),
-                "max_vfi_kilopixels": ("INT", {"default": 0, "min": 0, "max": 100000}),
+                "frames": ("IMAGE", {"tooltip": "Input frames as IMAGE tensor"}),
+                "scale": ("INT", {"default": 2, "min": 0, "max": 16, "tooltip": "Spatial upscale factor. 0 = skip upscaling"}),
+                "interpolation_factor": ("INT", {"default": 2, "min": 0, "max": 16, "tooltip": "FPS multiplier. Values <2 = skip interpolation"}),
+                "vfi_method": (vfi_methods, {"tooltip": "Frame interpolation method. RIFE and FILM require comfyui-frame-interpolation."}),
+                "frames_per_chunk": ("INT", {"default": 100, "min": 1, "max": 100000, "tooltip": "Number of frames to process at a time"}),
+                "max_tile_kilopixels": ("INT", {"default": 0, "min": 0, "max": 100000, "tooltip": "Used for VSR tiling. Set as high as your VRAM allows. 0 = auto-calculate based on available VRAM."}),
+                "max_gimm_kilopixels": ("INT", {"default": 0, "min": 0, "max": 100000, "tooltip": "GIMM-VFI only. Max kilopixels for flow estimation. 0 = auto."}),
             }
         }
 
@@ -63,7 +73,7 @@ class VSRFIFramesNode:
     FUNCTION = "process"
     CATEGORY = "video"
 
-    def process(self, frames, scale, interpolation_factor, frames_per_chunk, max_tile_kilopixels, max_vfi_kilopixels):
+    def process(self, frames, scale, interpolation_factor, vfi_method, frames_per_chunk, max_tile_kilopixels, max_gimm_kilopixels):
         # Unload all ComfyUI models (e.g. video generation) and free VRAM before loading our models
         if comfy is not None:
             comfy.model_management.unload_all_models()
@@ -80,23 +90,30 @@ class VSRFIFramesNode:
         N, h, w, c = frames.shape
         print(f"[DEBUG] Original input: {w}x{h}")
 
-        frames_resized = frames
-
-        # Process: upscale all frames first, then interpolate
-        print(f"[INFO] Processing {frames_resized.shape[0]} frames at {w}x{h} -> {w*scale}x{h*scale}")
-
-        # Step 1: Upscale all frames spatially in chunks
-        pipe = self.load_flashvsr(device)
-        upscaled_frames = self.upscale_all_frames(pipe, frames_resized, scale, frames_per_chunk, max_tile_kilopixels, device)
-        del pipe
-        clean_vram()
+        # Step 1: Upscale all frames spatially (skip if scale == 0)
+        if scale > 0:
+            print(f"[INFO] Processing {N} frames at {w}x{h} -> {w*scale}x{h*scale}")
+            pipe = self.load_flashvsr(device)
+            upscaled_frames = self.upscale_all_frames(pipe, frames, scale, frames_per_chunk, max_tile_kilopixels, device)
+            del pipe
+            clean_vram()
+        else:
+            print(f"[INFO] Skipping upscaling (scale=0), {N} frames at {w}x{h}")
+            upscaled_frames = frames
 
         # Step 2: Frame interpolation (if needed)
         if interpolation_factor > 1:
-            vfi = self.load_vfi(device)
-            print(f"[INFO] Interpolating {upscaled_frames.shape[0]} frames by {interpolation_factor}x")
-            final_frames = self.interpolate_all_frames(vfi, upscaled_frames, interpolation_factor, max_vfi_kilopixels, device)
-            del vfi
+            print(f"[INFO] Interpolating {upscaled_frames.shape[0]} frames by {interpolation_factor}x using {vfi_method}")
+            if vfi_method == "RIFE":
+                model = self.load_rife(device)
+                final_frames = self.interpolate_rife(model, upscaled_frames, interpolation_factor, device)
+            elif vfi_method == "FILM":
+                model = self.load_film(device)
+                final_frames = self.interpolate_film(model, upscaled_frames, interpolation_factor, device)
+            else:
+                model = self.load_vfi(device)
+                final_frames = self.interpolate_all_frames(model, upscaled_frames, interpolation_factor, max_gimm_kilopixels, device)
+            del model
             clean_vram()
         else:
             final_frames = upscaled_frames
@@ -381,7 +398,133 @@ class VSRFIFramesNode:
 
         return result
 
-    def interpolate_all_frames(self, vfi, frames, factor, max_vfi_kilopixels, device):
+    def _get_cfi_path(self):
+        if not _cfi_available:
+            raise RuntimeError(
+                "RIFE/FILM require comfyui-frame-interpolation to be installed. "
+                "Install from: https://github.com/Fannovel16/ComfyUI-Frame-Interpolation"
+            )
+        return _cfi_path
+
+    def load_rife(self, device):
+        cfi = self._get_cfi_path()
+        if cfi not in sys.path:
+            sys.path.insert(0, cfi)
+        from vfi_models.rife.rife_arch import IFNet
+        from vfi_utils import load_file_from_github_release
+
+        model_path = load_file_from_github_release("rife", "rife49.pth")
+        model = IFNet(arch_ver="4.7")
+        model.load_state_dict(torch.load(model_path, map_location="cpu"))
+        model.eval().to(device)
+        return model
+
+    def load_film(self, device):
+        cfi = self._get_cfi_path()
+        if cfi not in sys.path:
+            sys.path.insert(0, cfi)
+        from vfi_utils import load_file_from_github_release
+
+        model_path = load_file_from_github_release("film", "film_net_fp32.pt")
+        model = torch.jit.load(model_path, map_location="cpu")
+        model.eval().to(device)
+        return model
+
+    def interpolate_rife(self, model, frames, factor, device):
+        """Interpolate frames using RIFE (rife49, ensemble=True)."""
+        frames = frames.cpu()
+        clean_vram()
+
+        frames_chw = rearrange(frames, "N H W C -> N C H W")
+        scale_list = [8, 4, 2, 1]
+        result = []
+
+        pbar = comfy.utils.ProgressBar(len(frames) - 1) if comfy is not None else None
+
+        for i in range(len(frames) - 1):
+            if comfy is not None:
+                comfy.model_management.throw_exception_if_processing_interrupted()
+
+            result.append(frames[i])
+            frame_0 = frames_chw[i:i+1].to(device).float()
+            frame_1 = frames_chw[i+1:i+2].to(device).float()
+
+            for j in range(1, factor):
+                timestep = j / factor
+                with torch.no_grad():
+                    mid = model(frame_0, frame_1, timestep, scale_list, True, True)
+                result.append(mid[0].detach().cpu().permute(1, 2, 0).clamp(0, 1))
+
+            if pbar is not None:
+                pbar.update(1)
+
+            if (i + 1) % 10 == 0:
+                soft_empty_cache()
+
+        result.append(frames[-1])
+        return torch.stack(result)
+
+    def interpolate_film(self, model, frames, factor, device):
+        """Interpolate frames using FILM (recursive binary subdivision)."""
+        frames = frames.cpu()
+        clean_vram()
+
+        frames_chw = rearrange(frames, "N H W C -> N C H W")
+        result = []
+
+        pbar = comfy.utils.ProgressBar(len(frames) - 1) if comfy is not None else None
+
+        for i in range(len(frames) - 1):
+            if comfy is not None:
+                comfy.model_management.throw_exception_if_processing_interrupted()
+
+            frame_0 = frames_chw[i:i+1].to(device).float()
+            frame_1 = frames_chw[i+1:i+2].to(device).float()
+
+            mid_frames = self._film_inference(model, frame_0, frame_1, factor - 1)
+            # mid_frames includes both endpoints; take all but last to avoid duplicates
+            for f in mid_frames[:-1]:
+                result.append(f[0].detach().cpu().permute(1, 2, 0).clamp(0, 1))
+
+            if pbar is not None:
+                pbar.update(1)
+
+            if (i + 1) % 10 == 0:
+                soft_empty_cache()
+
+        result.append(frames[-1])
+        return torch.stack(result)
+
+    @staticmethod
+    def _film_inference(model, img_batch_1, img_batch_2, inter_frames):
+        """Recursive binary subdivision interpolation for FILM."""
+        results = [img_batch_1, img_batch_2]
+        idxes = [0, inter_frames + 1]
+        remains = list(range(1, inter_frames + 1))
+        splits = torch.linspace(0, 1, inter_frames + 2)
+
+        for _ in range(len(remains)):
+            starts = splits[idxes[:-1]]
+            ends = splits[idxes[1:]]
+            distances = ((splits[None, remains] - starts[:, None]) / (ends[:, None] - starts[:, None]) - .5).abs()
+            matrix = torch.argmin(distances).item()
+            start_i, step = np.unravel_index(matrix, distances.shape)
+            end_i = start_i + 1
+
+            x0 = results[start_i]
+            x1 = results[end_i]
+            dt = x0.new_full((1, 1), (splits[remains[step]] - splits[idxes[start_i]])) / (splits[idxes[end_i]] - splits[idxes[start_i]])
+
+            with torch.no_grad():
+                prediction = model(x0, x1, dt)
+            insert_position = bisect.bisect_left(idxes, remains[step])
+            idxes.insert(insert_position, remains[step])
+            results.insert(insert_position, prediction.clamp(0, 1).float())
+            del remains[step]
+
+        return results
+
+    def interpolate_all_frames(self, vfi, frames, factor, max_gimm_kilopixels, device):
         """Interpolate frames to increase frame count"""
         # Move frames to CPU to free GPU memory for VFI computation
         frames = frames.cpu()
@@ -395,10 +538,10 @@ class VSRFIFramesNode:
         padded_h = h + (pad_factor - h % pad_factor) % pad_factor
         padded_w = w + (pad_factor - w % pad_factor) % pad_factor
         padded_pixels = padded_h * padded_w
-        if max_vfi_kilopixels == 0:
+        if max_gimm_kilopixels == 0:
             max_pixels = 1000000
         else:
-            max_pixels = max_vfi_kilopixels * 1000
+            max_pixels = max_gimm_kilopixels * 1000
         if padded_pixels > max_pixels:
             raw_ds = (max_pixels / padded_pixels) ** 0.5
             a, b = padded_h // 32, padded_w // 32
