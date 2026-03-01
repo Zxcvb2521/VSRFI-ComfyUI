@@ -55,6 +55,9 @@ On first use, the node will automatically download:
    - Downloaded to: `ComfyUI/models/interpolation/gimm-vfi/`
 
 ## Usage
+There are two different versions of the node:
+*Frames* - This node works like most comfy nodes and takes in video frames as input and returns upscaled video frames as output. All frames need to be in memory at the same time.
+*Stream* - This version streams chunks of frames from a video file, upscales them, saves them into the output video file, and repeats. The maximum number of frames ever in memory at once is determined by frames_per_chunk parameter. This allows processing of long videos and even movies.
 
 ### Parameters
 
