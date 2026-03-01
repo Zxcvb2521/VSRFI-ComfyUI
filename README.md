@@ -73,3 +73,8 @@ There are two different versions of the node:
 | **frames_per_chunk** | Number of frames processed at once (reduce for lower VRAM) |
 | **max_tile_kilopixels** | Determines tile size when upscaling. Set this as high as your VRAM allows, or leave at 0 to auto calculate |
 | **max_GIMM_kilopixels** | Input size for GIMM flow estimation. Leave at 0 to auto calculate |
+
+## Acknowledgments
+- ComfyUI-FlashVSR_Ultra_Fast - https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast
+- ComfyUI-GIMM-VFI - https://github.com/kijai/ComfyUI-GIMM-VFI
+- ComfyUI-Frame-Interpolation - https://github.com/Fannovel16/ComfyUI-Frame-Interpolation
