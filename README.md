@@ -17,7 +17,7 @@
 
 ```bash
 cd /path/to/ComfyUI/custom_nodes
-git clone https://github.com/neilthefrobot/VSRFI.git
+git clone https://github.com/Zxcvb2521/VSRFI-ComfyUI.git
 ```
 
 ### 2. Install dependencies:
