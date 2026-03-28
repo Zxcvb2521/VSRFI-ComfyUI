@@ -17,13 +17,13 @@
 
 ```bash
 cd /path/to/ComfyUI/custom_nodes
-git clone https://github.com/neilthefrobot/VSRFI.git
+git clone https://github.com/neilthefrobot/VSRFI-ComfyUI.git
 ```
 
 ### 2. Install dependencies:
 
 ```bash
-cd VSRFI
+cd VSRFI-ComfyUI
 pip install -r requirements.txt
 ```
 
